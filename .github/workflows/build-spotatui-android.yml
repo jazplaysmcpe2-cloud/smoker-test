@@ -1,0 +1,301 @@
+name: Build Spotatui Android Release APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-spotatui-android.yml'
+      - 'patches/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spotatui-android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Get official Spotatui source
+        uses: actions/checkout@v7
+        with:
+          repository: LargeModGames/spotatui
+          ref: c44f106faa49642832ba224ee01b760cb2351f52
+          path: spotatui-source
+
+      - name: Record exact source revision
+        working-directory: spotatui-source
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD | tee "$GITHUB_WORKSPACE/spotatui-source-commit.txt"
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: spotatui-source/mobile/app/package-lock.json
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Install Android SDK, emulator, and NDK
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "emulator" \
+            "system-images;android-36;google_apis;x86_64" \
+            "ndk;27.1.12297006"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.1.12297006" >> "$GITHUB_ENV"
+
+      - name: Set up Rust for phone and emulator architectures
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Build optimized native Android core
+        working-directory: spotatui-source/mobile/core
+        run: |
+          set -euo pipefail
+          cargo ndk -t arm64-v8a -t x86_64 -P 26 \
+            -o ../app/modules/spotatui-core/android/src/main/jniLibs \
+            build --release
+
+      - name: Install app dependencies
+        working-directory: spotatui-source/mobile/app
+        run: npm ci
+
+      - name: Configure Android architectures and cleartext loopback
+        working-directory: spotatui-source/mobile/app
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("app.json")
+          config = json.loads(path.read_text())
+          expo = config.setdefault("expo", {})
+          android = expo.setdefault("android", {})
+          android["usesCleartextTraffic"] = True
+
+          found_build_properties = False
+          for plugin in expo.get("plugins", []):
+              if (isinstance(plugin, list) and len(plugin) > 1
+                      and plugin[0] == "expo-build-properties"
+                      and isinstance(plugin[1], dict)):
+                  plugin[1].setdefault("android", {})["buildArchs"] = ["arm64-v8a", "x86_64"]
+                  found_build_properties = True
+          if not found_build_properties:
+              raise SystemExit("Expected expo-build-properties plugin was not found; refusing an unverified config.")
+
+          path.write_text(json.dumps(config, indent=2) + "\n")
+          PY
+
+      - name: Align mobile home helpers with current GUI exports
+        working-directory: spotatui-source/mobile/app
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          from pathlib import Path
+
+          home = Path("src/app/(tabs)/index.tsx")
+          source = home.read_text()
+          old = "import { asksDiscover, greeting, madeForYou, recentAlbums, SHELF_MAX } from '@gui/pagesModel';"
+          new = "import { asksDiscover } from '@gui/pagesModel';\nimport { greeting, madeForYou, recentAlbums, SHELF_MAX } from '@/mobilePagesModel';"
+          if source.count(old) != 1:
+              raise SystemExit("Expected mobile home helper import was not found exactly once; refusing a blind patch.")
+          home.write_text(source.replace(old, new, 1))
+          PYCODE
+
+          cat > src/mobilePagesModel.ts <<'TS'
+          import type { DiscoverPayload } from '@gui/bindings/DiscoverPayload';
+          import type { DiscoverPlaylist } from '@gui/bindings/DiscoverPlaylist';
+          import type { TrackInfo } from '@gui/bindings/TrackInfo';
+
+          /** Maximum number of cards shown in each horizontally scrolling home shelf. */
+          export const SHELF_MAX = 10;
+
+          /** A time-of-day greeting, kept local to the mobile Home screen. */
+          export function greeting(hour: number): string {
+            if (hour < 12) return 'Good morning';
+            if (hour < 18) return 'Good afternoon';
+            return 'Good evening';
+          }
+
+          /** Flatten Made For You shelves while preserving server-provided order. */
+          export function madeForYou(discover: DiscoverPayload | null): DiscoverPlaylist[] {
+            return (discover?.shelves ?? []).flatMap((shelf) => shelf.playlists);
+          }
+
+          /** Recent album cards: the first track per album wins, most recent first. */
+          export function recentAlbums(tracks: TrackInfo[]): TrackInfo[] {
+            const seen = new Set<string>();
+            return tracks.filter((track) => {
+              const albumId = track.album_id;
+              if (!albumId || seen.has(albumId)) return false;
+              seen.add(albumId);
+              return true;
+            });
+          }
+          TS
+
+      - name: Prevent an indefinite font-loading splash
+        working-directory: spotatui-source/mobile/app
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/app/_layout.tsx")
+          source = path.read_text()
+          old = """export default function RootLayout() {
+            const [fontsLoaded] = useFonts(fontFiles);
+          """
+          new = """export default function RootLayout() {
+            const [fontsLoaded, fontError] = useFonts(fontFiles);
+            const [fontLoadTimedOut, setFontLoadTimedOut] = useState(false);
+          """
+          if source.count(old) != 1:
+              raise SystemExit("RootLayout font declaration changed upstream; refusing a blind patch.")
+          source = source.replace(old, new, 1)
+
+          old = """  useEffect(() => {
+              if (fontsLoaded) SplashScreen.hideAsync();
+            }, [fontsLoaded]);
+            if (!fontsLoaded) return null;
+          """
+          new = """  useEffect(() => {
+              const timeout = setTimeout(() => setFontLoadTimedOut(true), 8000);
+              return () => clearTimeout(timeout);
+            }, []);
+            const canRender = fontsLoaded || Boolean(fontError) || fontLoadTimedOut;
+            useEffect(() => {
+              if (canRender) {
+                void SplashScreen.hideAsync().catch(() => undefined);
+              }
+            }, [canRender]);
+            useEffect(() => {
+              if (fontError) console.warn('[Spotatui] Font loading failed; using system fallback.', fontError);
+              if (fontLoadTimedOut && !fontsLoaded && !fontError) {
+                console.warn('[Spotatui] Font loading timed out; using system fallback.');
+              }
+            }, [fontError, fontLoadTimedOut, fontsLoaded]);
+            if (!canRender) return null;
+          """
+          if source.count(old) != 1:
+              raise SystemExit("RootLayout splash logic changed upstream; refusing a blind patch.")
+          source = source.replace(old, new, 1)
+          path.write_text(source)
+          PY
+
+      - name: Lint and type-check mobile app
+        working-directory: spotatui-source/mobile/app
+        run: |
+          set -euo pipefail
+          npx expo lint
+          npx tsc --noEmit
+
+      - name: Generate Android project
+        working-directory: spotatui-source/mobile/app
+        run: npx expo prebuild --platform android --no-install
+
+      - name: Build standalone release APK
+        working-directory: spotatui-source/mobile/app/android
+        run: ./gradlew --no-daemon --stacktrace clean :app:assembleRelease
+
+      - name: Verify APK signature, embedded JavaScript, SDK, and native ABIs
+        working-directory: spotatui-source/mobile/app/android
+        run: |
+          set -euo pipefail
+          APK="app/build/outputs/apk/release/app-release.apk"
+          test -s "$APK"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose "$APK"
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" | tee "$GITHUB_WORKSPACE/apk-badging.txt"
+          grep -q "package: name='com.largemodgames.spotatui'" "$GITHUB_WORKSPACE/apk-badging.txt"
+          grep -q "sdkVersion:'26'" "$GITHUB_WORKSPACE/apk-badging.txt"
+          unzip -Z1 "$APK" | grep -Fxq 'assets/index.android.bundle'
+          unzip -Z1 "$APK" | grep -Fxq 'lib/arm64-v8a/libspotatui_mobile.so'
+          unzip -Z1 "$APK" | grep -Fxq 'lib/x86_64/libspotatui_mobile.so'
+          unzip -p "$APK" assets/index.android.bundle > "$GITHUB_WORKSPACE/index.android.bundle"
+          test "$(wc -c < "$GITHUB_WORKSPACE/index.android.bundle")" -gt 100000
+          sha256sum "$APK" | tee "$GITHUB_WORKSPACE/SHA256SUMS.txt"
+          cp "$APK" "$GITHUB_WORKSPACE/spotatui-android-release.apk"
+
+      - name: Upload release APK and checksum
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: spotatui-android-release-apk
+          path: |
+            spotatui-android-release.apk
+            SHA256SUMS.txt
+            spotatui-source-commit.txt
+            apk-badging.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Enable and verify KVM for Android emulator
+        run: |
+          set -euo pipefail
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::This runner does not expose /dev/kvm; hardware-accelerated Android emulator testing is unavailable."
+            exit 1
+          fi
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo chmod 0666 /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+          ls -l /dev/kvm
+          "$ANDROID_HOME/emulator/emulator" -accel-check
+
+      - name: Smoke-test standalone APK in Android emulator (two cold starts)
+        uses: ReactiveCircus/android-emulator-runner@v2
+        with:
+          api-level: 36
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 4
+          ram-size: 4096M
+          emulator-boot-timeout: 600
+          emulator-options: -no-window -gpu swiftshader -no-snapshot -noaudio -no-boot-anim
+          disable-linux-hw-accel: false
+          disable-animations: true
+          script: echo 'IyEvdXNyL2Jpbi9lbnYgYmFzaApzZXQgLUVldW8gcGlwZWZhaWwKCjogIiR7R0lUSFVCX1dPUktTUEFDRTo/R0lUSFVCX1dPUktTUEFDRSBtdXN0IGJlIHNldCBieSBHaXRIdWIgQWN0aW9uc30iCkFQSz0iJHtHSVRIVUJfV09SS1NQQUNFfS9zcG90YXR1aS1hbmRyb2lkLXJlbGVhc2UuYXBrIgpQQUNLQUdFPSJjb20ubGFyZ2Vtb2RnYW1lcy5zcG90YXR1aSIKCmNvbGxlY3RfZGlhZ25vc3RpY3MoKSB7CiAgbG9jYWwgc3RhdHVzPSQ/CiAgdHJhcCAtIEVSUgogIGVjaG8gIlNtb2tlLXRlc3QgY29tbWFuZCBmYWlsZWQgKGV4aXQgJHtzdGF0dXN9KTsgY29sbGVjdGluZyBlbXVsYXRvciBkaWFnbm9zdGljcy4iID4mMgogIGFkYiBsb2djYXQgLWQgLXYgdGhyZWFkdGltZSA+ICIke0dJVEhVQl9XT1JLU1BBQ0V9L3Nwb3RhdHVpLWxvZ2NhdC1yb3VuZC1mYWlsdXJlLnR4dCIgMj4mMSB8fCB0cnVlCiAgYWRiIHNoZWxsIGR1bXBzeXMgYWN0aXZpdHkgYWN0aXZpdGllcyA+ICIke0dJVEhVQl9XT1JLU1BBQ0V9L3Nwb3RhdHVpLWFjdGl2aXR5LXJvdW5kLWZhaWx1cmUudHh0IiAyPiYxIHx8IHRydWUKICBhZGIgZGV2aWNlcyAtbCA+ICIke0dJVEhVQl9XT1JLU1BBQ0V9L3Nwb3RhdHVpLWFkYi1kZXZpY2VzLWZhaWx1cmUudHh0IiAyPiYxIHx8IHRydWUKICBleGl0ICIkc3RhdHVzIgp9CnRyYXAgY29sbGVjdF9kaWFnbm9zdGljcyBFUlIKCmlmIFtbICEgLXMgIiRBUEsiIF1dOyB0aGVuCiAgZWNobyAiRVJST1I6IEV4cGVjdGVkIHJlbGVhc2UgQVBLIGlzIG1pc3Npbmcgb3IgZW1wdHk6ICRBUEsiID4mMgogIGVjaG8gIldvcmtzcGFjZSBjb250ZW50czoiID4mMgogIGxzIC1sYWggIiRHSVRIVUJfV09SS1NQQUNFIiA+JjIgfHwgdHJ1ZQogIGV4aXQgMQpmaQppZiAhIGNvbW1hbmQgLXYgYWRiID4vZGV2L251bGwgMj4mMTsgdGhlbgogIGVjaG8gIkVSUk9SOiBhZGIgaXMgbm90IGF2YWlsYWJsZSBvbiBQQVRILiIgPiYyCiAgZXhpdCAxCmZpCgpwcmludGYgJ0FQSzogJXNcbicgIiRBUEsiCnByaW50ZiAnQVBLIHNpemU6ICVzIGJ5dGVzXG4nICIkKHdjIC1jIDwgIiRBUEsiIHwgdHIgLWQgJyAnKSIKYWRiIHdhaXQtZm9yLWRldmljZQphZGIgZGV2aWNlcyAtbAphZGIgaW5zdGFsbCAtciAiJEFQSyIKCmZvciByb3VuZCBpbiAxIDI7IGRvCiAgZWNobyAiQ29sZC1zdGFydCB0ZXN0ICR7cm91bmR9LzIiCiAgYWRiIHNoZWxsIGFtIGZvcmNlLXN0b3AgIiRQQUNLQUdFIgogIGFkYiBzaGVsbCBwbSBjbGVhciAiJFBBQ0tBR0UiCiAgYWRiIGxvZ2NhdCAtYwoKICBpZiAhIHN0YXJ0X291dHB1dD0kKGFkYiBzaGVsbCBhbSBzdGFydCAtVyAtYSBhbmRyb2lkLmludGVudC5hY3Rpb24uTUFJTiAtYyBhbmRyb2lkLmludGVudC5jYXRlZ29yeS5MQVVOQ0hFUiAtcCAiJFBBQ0tBR0UiIDI+JjEpOyB0aGVuCiAgICBlY2hvICJFUlJPUjogQW5kcm9pZCBsYXVuY2ggY29tbWFuZCBmYWlsZWQgaW4gY29sZC1zdGFydCByb3VuZCAke3JvdW5kfS4iID4mMgogICAgcHJpbnRmICclc1xuJyAiJHN0YXJ0X291dHB1dCIgPiYyCiAgICBhZGIgbG9nY2F0IC1kIC12IHRocmVhZHRpbWUgPiAiJHtHSVRIVUJfV09SS1NQQUNFfS9zcG90YXR1aS1sb2djYXQtcm91bmQtJHtyb3VuZH0udHh0IiAyPiYxIHx8IHRydWUKICAgIGV4aXQgMQogIGZpCiAgcHJpbnRmICclc1xuJyAiJHN0YXJ0X291dHB1dCIKICBpZiAhIGdyZXAgLUZxICdTdGF0dXM6IG9rJyA8PDwgIiRzdGFydF9vdXRwdXQiOyB0aGVuCiAgICBlY2hvICJFUlJPUjogQW5kcm9pZCBkaWQgbm90IHJlcG9ydCBTdGF0dXM6IG9rIGluIGNvbGQtc3RhcnQgcm91bmQgJHtyb3VuZH0uIiA+JjIKICAgIGFkYiBsb2djYXQgLWQgLXYgdGhyZWFkdGltZSA+ICIke0dJVEhVQl9XT1JLU1BBQ0V9L3Nwb3RhdHVpLWxvZ2NhdC1yb3VuZC0ke3JvdW5kfS50eHQiIDI+JjEgfHwgdHJ1ZQogICAgZXhpdCAxCiAgZmkKCiAgcmVhZHk9MAogIGZvciBhdHRlbXB0IGluICQoc2VxIDEgNjApOyBkbwogICAgc2xlZXAgMgogICAgYWN0aXZpdHlfc3RhdGU9IiQoYWRiIHNoZWxsIGR1bXBzeXMgYWN0aXZpdHkgYWN0aXZpdGllcyAyPi9kZXYvbnVsbCB8fCB0cnVlKSIKICAgIGlmIGFkYiBzaGVsbCBwaWRvZiAiJFBBQ0tBR0UiID4vZGV2L251bGwgMj4mMSAmJiBcCiAgICAgIGdyZXAgLUUgJ21SZXN1bWVkQWN0aXZpdHl8dG9wUmVzdW1lZEFjdGl2aXR5fFJlc3VtZWRBY3Rpdml0eScgPDw8ICIkYWN0aXZpdHlfc3RhdGUiIHwgXAogICAgICAgIGdyZXAgLUYgIiRQQUNLQUdFIiA+L2Rldi9udWxsOyB0aGVuCiAgICAgIHJlYWR5PTEKICAgICAgYnJlYWsKICAgIGZpCiAgZG9uZQoKICBpZiBbWyAiJHJlYWR5IiAtZXEgMSBdXTsgdGhlbiBzbGVlcCA4OyBmaQogIExPR0NBVD0iJHtHSVRIVUJfV09SS1NQQUNFfS9zcG90YXR1aS1sb2djYXQtcm91bmQtJHtyb3VuZH0udHh0IgogIEFDVElWSVRZPSIke0dJVEhVQl9XT1JLU1BBQ0V9L3Nwb3RhdHVpLWFjdGl2aXR5LXJvdW5kLSR7cm91bmR9LnR4dCIKICBVSV9YTUw9IiR7R0lUSFVCX1dPUktTUEFDRX0vc3BvdGF0dWktdWktcm91bmQtJHtyb3VuZH0ueG1sIgogIFNDUkVFTlNIT1Q9IiR7R0lUSFVCX1dPUktTUEFDRX0vc3BvdGF0dWktc2NyZWVuLXJvdW5kLSR7cm91bmR9LnBuZyIKICBhZGIgbG9nY2F0IC1kIC12IHRocmVhZHRpbWUgPiAiJExPR0NBVCIKICBhZGIgc2hlbGwgZHVtcHN5cyBhY3Rpdml0eSBhY3Rpdml0aWVzID4gIiRBQ1RJVklUWSIgMj4mMSB8fCB0cnVlCiAgdGltZW91dCAyMHMgYWRiIHNoZWxsIHVpYXV0b21hdG9yIGR1bXAgL3NkY2FyZC9zcG90YXR1aS13aW5kb3cueG1sID4vZGV2L251bGwgMj4mMSB8fCB0cnVlCiAgYWRiIHNoZWxsIGNhdCAvc2RjYXJkL3Nwb3RhdHVpLXdpbmRvdy54bWwgPiAiJFVJX1hNTCIgMj4vZGV2L251bGwgfHwgdHJ1ZQogIGFkYiBleGVjLW91dCBzY3JlZW5jYXAgLXAgPiAiJFNDUkVFTlNIT1QiIDI+L2Rldi9udWxsIHx8IHRydWUKCiAgaWYgW1sgIiRyZWFkeSIgLW5lIDEgXV07IHRoZW4KICAgIGVjaG8gIkVSUk9SOiBBcHAgZGlkIG5vdCByZWFjaCBhIHJlc3VtZWQgZm9yZWdyb3VuZCBhY3Rpdml0eSB3aXRoaW4gMTIwIHNlY29uZHMgaW4gcm91bmQgJHtyb3VuZH0uIiA+JjIKICAgIGVjaG8gJy0tLSBBY3Rpdml0eSBzdGF0ZSAtLS0nID4mMgogICAgZ3JlcCAtRSAnUmVzdW1lZEFjdGl2aXR5fHRvcFJlc3VtZWRBY3Rpdml0eXxtUmVzdW1lZEFjdGl2aXR5fGNvbVwubGFyZ2Vtb2RnYW1lc1wuc3BvdGF0dWknICIkQUNUSVZJVFkiIHwgdGFpbCAtbiA4MCA+JjIgfHwgdHJ1ZQogICAgZWNobyAnLS0tIFJlY2VudCBsb2djYXQgLS0tJyA+JjIKICAgIHRhaWwgLW4gMzAwICIkTE9HQ0FUIiA+JjIgfHwgdHJ1ZQogICAgZXhpdCAxCiAgZmkKCiAgaWYgZ3JlcCAtQSAzMCAtQiAzIC1FICdGQVRBTCBFWENFUFRJT058VW5zYXRpc2ZpZWRMaW5rRXJyb3J8ZGxvcGVuIGZhaWxlZCcgIiRMT0dDQVQiIHwgZ3JlcCAtRiAiJFBBQ0tBR0UiID4vZGV2L251bGw7IHRoZW4KICAgIGVjaG8gIkVSUk9SOiBGYXRhbCBKYXZhL25hdGl2ZSBzdGFydHVwIGVycm9yIGZvdW5kIGluIFNwb3RhdHVpIHJvdW5kICR7cm91bmR9LiIgPiYyCiAgICB0YWlsIC1uIDMwMCAiJExPR0NBVCIgPiYyCiAgICBleGl0IDEKICBmaQogIGlmICEgYWRiIHNoZWxsIHBpZG9mICIkUEFDS0FHRSIgPi9kZXYvbnVsbCAyPiYxOyB0aGVuCiAgICBlY2hvICJFUlJPUjogU3BvdGF0dWkgcHJvY2VzcyBleGl0ZWQgYWZ0ZXIgbGF1bmNoIGluIGNvbGQtc3RhcnQgcm91bmQgJHtyb3VuZH0uIiA+JjIKICAgIHRhaWwgLW4gMzAwICIkTE9HQ0FUIiA+JjIKICAgIGV4aXQgMQogIGZpCiAgYWN0aXZpdHlfc3RhdGU9IiQoYWRiIHNoZWxsIGR1bXBzeXMgYWN0aXZpdHkgYWN0aXZpdGllcyAyPi9kZXYvbnVsbCB8fCB0cnVlKSIKICBpZiAhIGdyZXAgLUUgJ21SZXN1bWVkQWN0aXZpdHl8dG9wUmVzdW1lZEFjdGl2aXR5fFJlc3VtZWRBY3Rpdml0eScgPDw8ICIkYWN0aXZpdHlfc3RhdGUiIHwgZ3JlcCAtRiAiJFBBQ0tBR0UiID4vZGV2L251bGw7IHRoZW4KICAgIGVjaG8gIkVSUk9SOiBTcG90YXR1aSBubyBsb25nZXIgb3ducyB0aGUgcmVzdW1lZCBhY3Rpdml0eSBhZnRlciBzdGFydHVwIGluIHJvdW5kICR7cm91bmR9LiIgPiYyCiAgICB0YWlsIC1uIDMwMCAiJEFDVElWSVRZIiA+JjIgfHwgdHJ1ZQogICAgdGFpbCAtbiAzMDAgIiRMT0dDQVQiID4mMgogICAgZXhpdCAxCiAgZmkKICBlY2hvICJDb2xkLXN0YXJ0IHRlc3QgJHtyb3VuZH0gcGFzc2VkLiIKZG9uZQoKZWNobyAnQm90aCBTcG90YXR1aSBjb2xkLXN0YXJ0IHNtb2tlIHRlc3RzIHBhc3NlZC4nCg==' | base64 -d > /tmp/spotatui-smoke-test.sh && bash /tmp/spotatui-smoke-test.sh
+
+      - name: Upload diagnostic logs if smoke test fails
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: spotatui-android-smoke-test-diagnostics
+          path: |
+            spotatui-logcat-round-*.txt
+            spotatui-ui-round-*.xml
+            spotatui-screen-round-*.png
+            spotatui-activity-round-*.txt
+            spotatui-adb-devices-failure.txt
+            apk-badging.txt
+            SHA256SUMS.txt
+          if-no-files-found: ignore
+          retention-days: 7
