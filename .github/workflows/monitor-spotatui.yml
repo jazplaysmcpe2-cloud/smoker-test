@@ -1,0 +1,140 @@
+name: Monitor Spotatui build status
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  issues: write
+  contents: read
+
+concurrency:
+  group: spotatui-build-status-monitor
+  cancel-in-progress: true
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check latest build and smoke-test runs
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const targets = [
+              { owner: 'jazplaysmcpe2-cloud', repo: 'smoker-test', label: 'Combined build + smoke test' },
+              { owner: 'jazplaysmcpe2-cloud', repo: 'spotatui-android-build', label: 'Main Android build' },
+            ];
+            const workflowName = 'Build Spotatui Android Release APK';
+            const results = [];
+
+            for (const target of targets) {
+              try {
+                const response = await github.request('GET /repos/{owner}/{repo}/actions/runs', {
+                  owner: target.owner,
+                  repo: target.repo,
+                  per_page: 20,
+                });
+                const runs = response.data.workflow_runs
+                  .filter(run => run.name === workflowName)
+                  .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+                const run = runs[0];
+                if (!run) {
+                  results.push({ ...target, status: 'missing', conclusion: 'no matching workflow run', url: `https://github.com/${target.owner}/${target.repo}/actions` });
+                } else {
+                  results.push({
+                    ...target,
+                    status: run.status,
+                    conclusion: run.conclusion || 'pending',
+                    url: run.html_url,
+                    runId: run.id,
+                    createdAt: run.created_at,
+                  });
+                }
+              } catch (error) {
+                results.push({ ...target, status: 'error', conclusion: String(error.message || error), url: `https://github.com/${target.owner}/${target.repo}/actions` });
+              }
+            }
+
+            const table = results.map(result => [
+              result.label,
+              result.status,
+              result.conclusion,
+              result.url,
+            ]);
+            await core.summary
+              .addHeading('Spotatui build monitor')
+              .addTable([
+                [{ data: 'Workflow', header: true }, { data: 'Status', header: true }, { data: 'Conclusion', header: true }, { data: 'Run', header: true }],
+                ...table,
+              ])
+              .addRaw('Scheduled to check every five minutes; GitHub may delay scheduled jobs during high load.')
+              .write();
+
+            const failed = results.filter(result =>
+              result.status === 'completed' && result.conclusion !== 'success'
+            );
+            const monitorTitle = 'Automated Spotatui CI status';
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            });
+            const existing = issues.data.find(issue =>
+              !issue.pull_request && issue.title === monitorTitle
+            );
+
+            const details = results.map(result =>
+              `- **${result.label}:** ${result.status} / ${result.conclusion} — ${result.url}`
+            ).join('\n');
+            const now = new Date().toISOString();
+
+            if (failed.length > 0) {
+              const body = [
+                'This issue is maintained by the five-minute Spotatui workflow monitor.',
+                '',
+                `Last checked: ${now}`,
+                '',
+                details,
+                '',
+                'Open the failed run above and inspect its first failing step and logs. This monitor reports status; it does not automatically modify application code.',
+              ].join('\n');
+              if (existing) {
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: existing.number,
+                  body,
+                });
+              } else {
+                await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: monitorTitle,
+                  body,
+                });
+              }
+              core.warning('At least one latest Spotatui build workflow has failed; the monitor issue was created or updated.');
+            } else if (results.length === targets.length &&
+                       results.every(result => result.status === 'completed' && result.conclusion === 'success')) {
+              if (existing) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: existing.number,
+                  body: `Both latest Spotatui workflows are successful as of ${now}. Closing this status issue.\n\n${details}`,
+                });
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: existing.number,
+                  state: 'closed',
+                });
+              }
+              core.info('Both latest Spotatui build workflows have succeeded.');
+            } else {
+              core.info('Spotatui workflow(s) are still running or status could not be verified. No failure is being claimed.');
+            }
